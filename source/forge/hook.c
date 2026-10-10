@@ -26,6 +26,7 @@
 #include "forge/hook.h"
 #include "forge/log.h"
 #include "forge/types.h"
+#include "forge/wrapper.h"
 #include <forge/nn/os.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,8 +35,27 @@
 #include <switch/kernel/svc.h>
 #include <unistd.h>
 
+#define HOOK_JIT_SIZE (4 * PAGE_SIZE)
+#define HOOK_JIT_MAX_CHUNKS 2
+#define HOOK_CONTEXT_STUB_SIZE 44
+
+typedef struct JitChunk {
+    Jit jit;
+    size_t used;
+} JitChunk;
+
+typedef struct JitSlot {
+    void* rw;
+    void* rx;
+} JitSlot;
+
 // Need to use nnsdk facilities because `thread_local` is not wired up correctly.
 static TlsSlot s_hookContextTlsSlot = -1;
+
+// Slots are never reused, so writing a new slot can't affect threads executing an existing one.
+static JitChunk s_jitChunks[HOOK_JIT_MAX_CHUNKS];
+static int s_jitChunkCount = 0;
+static u8 s_jitMutex[FORGE_NNOS_MUTEX_SIZE] __attribute__((aligned(4)));
 
 Result forge_hook_init(void)
 {
@@ -48,6 +68,8 @@ Result forge_hook_init(void)
         return r;
     }
 
+    forge_nnosInitializeMutex(s_jitMutex, false);
+
     return 0;
 }
 
@@ -57,6 +79,60 @@ __attribute__((noinline)) static void forge_hook_setContextInternal(void* contex
 }
 
 void* forge_hook_getContext(void) { return nnosGetTlsValue(s_hookContextTlsSlot); }
+
+static bool createJitChunk(JitChunk* chunk)
+{
+    Result rc = jitCreate(&chunk->jit, HOOK_JIT_SIZE);
+    if (R_FAILED(rc)) {
+        forge_log_error("Failed to create hook JIT: 0x%08X", rc);
+        return false;
+    }
+
+    // Writing while other slots execute requires the RW and RX mappings to coexist.
+    if (chunk->jit.type != JitType_CodeMemory) {
+        forge_log_error("Unsupported hook JIT type: %d", chunk->jit.type);
+        jitClose(&chunk->jit);
+        return false;
+    }
+
+    chunk->used = 0;
+    return true;
+}
+
+static bool allocJitSlotLocked(size_t size, JitSlot* out)
+{
+    JitChunk* chunk = s_jitChunkCount > 0 ? &s_jitChunks[s_jitChunkCount - 1] : NULL;
+
+    if (chunk == NULL || chunk->used + size > chunk->jit.size) {
+        if (s_jitChunkCount == HOOK_JIT_MAX_CHUNKS) {
+            forge_log_error("Hook JIT is full");
+            return false;
+        }
+
+        chunk = &s_jitChunks[s_jitChunkCount];
+        if (!createJitChunk(chunk)) {
+            return false;
+        }
+
+        s_jitChunkCount++;
+    }
+
+    out->rw = (u8*)chunk->jit.rw_addr + chunk->used;
+    out->rx = (u8*)chunk->jit.rx_addr + chunk->used;
+    chunk->used += size;
+    return true;
+}
+
+static bool allocJitSlot(size_t size, JitSlot* out)
+{
+    size = (size + 7) & ~(size_t)7;
+
+    forge_nnosLockMutex(s_jitMutex);
+    bool ok = allocJitSlotLocked(size, out);
+    forge_nnosUnlockMutex(s_jitMutex);
+
+    return ok;
+}
 
 static bool isThumbMode(uintptr_t addr) { return (addr & 1) != 0; }
 
@@ -91,23 +167,19 @@ static int calculateHookLength(uintptr_t addr, bool thumb, int min_length)
     return length;
 }
 
-static void syncCodeForExecution(void* addr, size_t size)
+static void syncCodeForExecution(void* rw_addr, void* rx_addr, size_t size)
 {
-    if (!addr || size == 0) {
-        return;
-    }
-
-    armICacheInvalidate(addr, size);
-    armDCacheFlush(addr, size);
+    armDCacheFlush(rw_addr, size);
+    armICacheInvalidate(rx_addr, size);
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("isb" ::: "memory");
 }
 
-static void* hookFunction(void* const target, void* const detour, Jit* const jit)
+static bool hookFunction(void* const target, void* const detour, void** original)
 {
     if (!target || !detour) {
         forge_log_error("Invalid parameters: target=%p, detour=%p", target, detour);
-        return NULL;
+        return false;
     }
 
     uintptr_t target_addr = (uintptr_t)(target);
@@ -125,15 +197,20 @@ static void* hookFunction(void* const target, void* const detour, Jit* const jit
         current_addr += getInstructionSize(current_addr, thumb_mode);
     }
 
-    uint32_t* trampoline = (uint32_t*)(jit->rw_addr);
-    if (trampoline && jit->size >= total_bytes + 20u) {
+    if (original != NULL) {
+        size_t trampoline_size = (size_t)(total_bytes + 8);
+        JitSlot slot;
+
+        if (!allocJitSlot(trampoline_size, &slot)) {
+            return false;
+        }
+
         if (thumb_mode) {
-            uint16_t* thumb_tramp = (uint16_t*)(trampoline);
+            uint16_t* thumb_tramp = (uint16_t*)(slot.rw);
             uint16_t* src = (uint16_t*)(real_target);
-            uint16_t* dst = thumb_tramp;
 
             for (int i = 0; i < total_bytes / 2; i++) {
-                dst[i] = src[i];
+                thumb_tramp[i] = src[i];
             }
 
             uintptr_t return_addr = real_target + total_bytes;
@@ -146,19 +223,26 @@ static void* hookFunction(void* const target, void* const detour, Jit* const jit
             thumb_tramp[total_bytes / 2 + 1] = 0xF000;
             *(uintptr_t*)(&thumb_tramp[total_bytes / 2 + 2]) = return_addr;
         } else {
-            uint32_t* arm_tramp = trampoline;
+            uint32_t* arm_tramp = (uint32_t*)(slot.rw);
             uint32_t* src = (uint32_t*)(real_target);
-            uint32_t* dst = arm_tramp;
 
             for (int i = 0; i < instruction_count; i++) {
-                dst[i] = src[i];
+                arm_tramp[i] = src[i];
             }
 
             uintptr_t return_addr = real_target + total_bytes;
             arm_tramp[instruction_count] = 0xE51FF004; // ldr pc, [pc, #-4]
             arm_tramp[instruction_count + 1] = return_addr;
         }
-        syncCodeForExecution(trampoline, (size_t)(total_bytes + 20));
+
+        syncCodeForExecution(slot.rw, slot.rx, trampoline_size);
+
+        uintptr_t result_ptr = (uintptr_t)(slot.rx);
+        if (thumb_mode) {
+            result_ptr |= 1;
+        }
+
+        *original = (void*)(result_ptr);
     }
 
     if (thumb_mode) {
@@ -178,42 +262,41 @@ static void* hookFunction(void* const target, void* const detour, Jit* const jit
         code[1] = hook_addr;
     }
 
-    syncCodeForExecution((void*)(real_target), (size_t)(total_bytes));
+    syncCodeForExecution((void*)(real_target), (void*)(real_target), (size_t)(total_bytes));
 
-    if (trampoline) {
-        uintptr_t result_ptr = (uintptr_t)(jit->rx_addr);
-
-        if (thumb_mode) {
-            result_ptr |= 1;
-        }
-
-        return (void*)(result_ptr);
-    }
-
-    return NULL;
+    return true;
 }
 
-// ARM trampoline that stores an embedded context value into TLS then tail-jumps to the detour.
+// ARM stub that stores the context into TLS then tail-jumps to the detour.
+// The context is read through the RW mapping so it can be updated without touching code.
 //   [0]  push {r0-r3, r12, lr}  ; 6 regs keeps stack 8-byte aligned
-//   [1]  ldr  r0,  [pc, #12]    ; r0  = context   (word at offset 24)
-//   [2]  ldr  r12, [pc, #12]    ; r12 = setContext (word at offset 28)
-//   [3]  blx  r12
-//   [4]  pop  {r0-r3, r12, lr}
-//   [5]  ldr  pc,  [pc, #4]     ; tail-jump → detour (word at offset 32)
-//   [6]  .word context
-//   [7]  .word &forge_hook_setContextInternal
-//   [8]  .word detour_addr
-static void writeContextTrampoline(uint32_t* buf, void* context, void* detour)
+//   [1]  ldr  r0,  [pc, #16]    ; r0  = &context  (word at offset 28)
+//   [2]  ldr  r0,  [r0]
+//   [3]  ldr  r12, [pc, #12]    ; r12 = setContext (word at offset 32)
+//   [4]  blx  r12
+//   [5]  pop  {r0-r3, r12, lr}
+//   [6]  ldr  pc,  [pc, #4]     ; tail-jump → detour (word at offset 36)
+//   [7]  .word &context (RW address)
+//   [8]  .word &forge_hook_setContextInternal
+//   [9]  .word detour_addr
+//   [10] .word context
+static void** writeContextStub(const JitSlot* slot, void* context, void* detour)
 {
+    uint32_t* buf = (uint32_t*)(slot->rw);
+
     buf[0] = 0xE92D500F; // push {r0, r1, r2, r3, r12, lr}
-    buf[1] = 0xE59F000C; // ldr r0,  [pc, #12]
-    buf[2] = 0xE59FC00C; // ldr r12, [pc, #12]
-    buf[3] = 0xE12FFF3C; // blx r12
-    buf[4] = 0xE8BD500F; // pop {r0, r1, r2, r3, r12, lr}
-    buf[5] = 0xE59FF004; // ldr pc, [pc, #4]
-    buf[6] = (uint32_t)(uintptr_t)context;
-    buf[7] = (uint32_t)(uintptr_t)forge_hook_setContextInternal;
-    buf[8] = (uint32_t)(uintptr_t)detour;
+    buf[1] = 0xE59F0010; // ldr r0,  [pc, #16]
+    buf[2] = 0xE5900000; // ldr r0,  [r0]
+    buf[3] = 0xE59FC00C; // ldr r12, [pc, #12]
+    buf[4] = 0xE12FFF3C; // blx r12
+    buf[5] = 0xE8BD500F; // pop {r0, r1, r2, r3, r12, lr}
+    buf[6] = 0xE59FF004; // ldr pc, [pc, #4]
+    buf[7] = (uint32_t)(uintptr_t)&buf[10];
+    buf[8] = (uint32_t)(uintptr_t)forge_hook_setContextInternal;
+    buf[9] = (uint32_t)(uintptr_t)detour;
+    buf[10] = (uint32_t)(uintptr_t)context;
+
+    return (void**)&buf[10];
 }
 
 Hook forge_hook_create(void* const target, void* const detour, void** original)
@@ -224,43 +307,11 @@ Hook forge_hook_create(void* const target, void* const detour, void** original)
     hook.has_ctx = false;
 
     if (original != NULL) {
-        Result rc = jitCreate(&hook.jit, PAGE_SIZE);
-
-        if (R_FAILED(rc)) {
-            forge_log_error("Failed to create JIT trampoline: 0x%08X", rc);
-            *original = NULL;
-            return hook;
-        }
-
-        rc = jitTransitionToWritable(&hook.jit);
-
-        if (R_FAILED(rc)) {
-            forge_log_error("Failed to transition trampoline to writable: 0x%08X", rc);
-            jitClose(&hook.jit);
-            *original = NULL;
-            return hook;
-        }
+        *original = NULL;
     }
 
-    void* final_trampoline = hookFunction(target, detour, &hook.jit);
-
-    if (original != NULL) {
-        if (final_trampoline != NULL) {
-            Result rc = jitTransitionToExecutable(&hook.jit);
-
-            if (R_FAILED(rc)) {
-                forge_log_error("Failed to transition trampoline to executable: 0x%08X", rc);
-                jitClose(&hook.jit);
-                *original = NULL;
-                return hook;
-            }
-
-            *original = final_trampoline;
-            hook.original = final_trampoline;
-        } else {
-            jitClose(&hook.jit);
-            *original = NULL;
-        }
+    if (hookFunction(target, detour, original) && original != NULL) {
+        hook.original = *original;
     }
 
     return hook;
@@ -274,75 +325,21 @@ Hook forge_hook_createWithContext(void* const target, void* const detour, void**
     hook.context = context;
     hook.has_ctx = true;
 
-    Result rc = jitCreate(&hook.ctx_jit, PAGE_SIZE);
-    if (R_FAILED(rc)) {
-        forge_log_error("Failed to create JIT context trampoline: 0x%08X", rc);
-        if (original)
-            *original = NULL;
-        return hook;
-    }
-
-    rc = jitTransitionToWritable(&hook.ctx_jit);
-    if (R_FAILED(rc)) {
-        forge_log_error("Failed to transition context trampoline to writable: 0x%08X", rc);
-        jitClose(&hook.ctx_jit);
-        if (original)
-            *original = NULL;
-        return hook;
-    }
-
-    writeContextTrampoline((uint32_t*)(hook.ctx_jit.rw_addr), context, detour);
-    syncCodeForExecution((void*)(hook.ctx_jit.rw_addr), 36);
-
-    rc = jitTransitionToExecutable(&hook.ctx_jit);
-    if (R_FAILED(rc)) {
-        forge_log_error("Failed to transition context trampoline to executable: 0x%08X", rc);
-        jitClose(&hook.ctx_jit);
-        if (original)
-            *original = NULL;
-        return hook;
-    }
-
-    void* ctx_trampoline = (void*)(hook.ctx_jit.rx_addr);
-
     if (original != NULL) {
-        rc = jitCreate(&hook.jit, PAGE_SIZE);
-        if (R_FAILED(rc)) {
-            forge_log_error("Failed to create JIT trampoline: 0x%08X", rc);
-            jitClose(&hook.ctx_jit);
-            *original = NULL;
-            return hook;
-        }
-
-        rc = jitTransitionToWritable(&hook.jit);
-        if (R_FAILED(rc)) {
-            forge_log_error("Failed to transition trampoline to writable: 0x%08X", rc);
-            jitClose(&hook.jit);
-            jitClose(&hook.ctx_jit);
-            *original = NULL;
-            return hook;
-        }
+        *original = NULL;
     }
 
-    void* final_trampoline = hookFunction(target, ctx_trampoline, &hook.jit);
+    JitSlot slot;
+    if (!allocJitSlot(HOOK_CONTEXT_STUB_SIZE, &slot)) {
+        forge_log_error("Failed to allocate context stub");
+        return hook;
+    }
 
-    if (original != NULL) {
-        if (final_trampoline != NULL) {
-            rc = jitTransitionToExecutable(&hook.jit);
-            if (R_FAILED(rc)) {
-                forge_log_error("Failed to transition trampoline to executable: 0x%08X", rc);
-                jitClose(&hook.jit);
-                jitClose(&hook.ctx_jit);
-                *original = NULL;
-                return hook;
-            }
-            *original = final_trampoline;
-            hook.original = final_trampoline;
-        } else {
-            jitClose(&hook.jit);
-            jitClose(&hook.ctx_jit);
-            *original = NULL;
-        }
+    hook.ctx_cell = writeContextStub(&slot, context, detour);
+    syncCodeForExecution(slot.rw, slot.rx, HOOK_CONTEXT_STUB_SIZE);
+
+    if (hookFunction(target, slot.rx, original) && original != NULL) {
+        hook.original = *original;
     }
 
     return hook;
@@ -350,26 +347,12 @@ Hook forge_hook_createWithContext(void* const target, void* const detour, void**
 
 Result forge_hook_updateContext(Hook* hook, void* new_ctx)
 {
-    if (!hook->has_ctx) {
+    if (!hook->has_ctx || hook->ctx_cell == NULL) {
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
 
-    Result rc = jitTransitionToWritable(&hook->ctx_jit);
-    if (R_FAILED(rc)) {
-        forge_log_error("Failed to transition JIT to writable: 0x%08X", rc);
-        return rc;
-    }
-
-    uint32_t* buffer = hook->ctx_jit.rw_addr;
-    buffer[6] = (uint32_t)(uintptr_t)new_ctx;
-
-    syncCodeForExecution(buffer, 36);
-
-    rc = jitTransitionToExecutable(&hook->ctx_jit);
-    if (R_FAILED(rc)) {
-        forge_log_error("Failed to transition JIT to executable: 0x%08X", rc);
-        return rc;
-    }
+    __atomic_store_n(hook->ctx_cell, new_ctx, __ATOMIC_RELEASE);
+    hook->context = new_ctx;
 
     return 0;
 }

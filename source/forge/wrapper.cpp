@@ -6,6 +6,8 @@ namespace nn::os {
 bool TryWaitLightEvent(LightEventType* event) noexcept;
 }
 
+static_assert(sizeof(nn::os::MutexType) == FORGE_NNOS_MUTEX_SIZE);
+
 extern "C" void forge_nnosInitializeLightEvent(void* event, bool initially_signaled, int clear_mode)
 {
     nn::os::InitializeLightEvent(
@@ -44,4 +46,19 @@ extern "C" bool forge_nnosTimedWaitLightEvent(void* event, u64 timeout)
 extern "C" void forge_nnosClearLightEvent(void* event)
 {
     nn::os::ClearLightEvent(static_cast<nn::os::LightEventType*>(event));
+}
+
+extern "C" void forge_nnosInitializeMutex(void* mutex, bool recursive)
+{
+    nn::os::InitializeMutex(static_cast<nn::os::MutexType*>(mutex), recursive, 0);
+}
+
+extern "C" void forge_nnosLockMutex(void* mutex)
+{
+    nn::os::LockMutex(static_cast<nn::os::MutexType*>(mutex));
+}
+
+extern "C" void forge_nnosUnlockMutex(void* mutex)
+{
+    nn::os::UnlockMutex(static_cast<nn::os::MutexType*>(mutex));
 }
