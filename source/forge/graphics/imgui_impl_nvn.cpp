@@ -882,10 +882,16 @@ IMGUI_IMPL_API void ImGui_ImplNVN_RenderDrawData(nvn::Queue* queue, ImDrawData* 
     const ImVec2 clipScale = drawData->FramebufferScale;
     const auto rt = bd->swapChainTextures[textureIndex];
 
+    size_t globalIdxOffset = 0;
+    int globalVtxOffset = 0;
     for (const auto drawList : drawData->CmdLists) {
         for (const auto& cmd : drawList->CmdBuffer) {
             if (cmd.UserCallback != nullptr) {
-                cmd.UserCallback(drawList, &cmd);
+                if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
+                    SetupRenderState(bd, textureIndex);
+                } else {
+                    cmd.UserCallback(drawList, &cmd);
+                }
             } else {
                 const ImVec2 clipMin {
                     std::clamp((cmd.ClipRect.x - clipOff.x) * clipScale.x, 0.0f, static_cast<float>(rt->GetWidth())),
@@ -917,10 +923,12 @@ IMGUI_IMPL_API void ImGui_ImplNVN_RenderDrawData(nvn::Queue* queue, ImDrawData* 
                     nvn::DrawPrimitive::TRIANGLES,
                     sizeof(ImDrawIdx) == 2 ? nvn::IndexType::UNSIGNED_SHORT : nvn::IndexType::UNSIGNED_INT,
                     static_cast<int>(cmd.ElemCount),
-                    idxBufferAddr + (cmd.IdxOffset * sizeof(ImDrawIdx)),
-                    cmd.VtxOffset);
+                    idxBufferAddr + ((globalIdxOffset + cmd.IdxOffset) * sizeof(ImDrawIdx)),
+                    globalVtxOffset + static_cast<int>(cmd.VtxOffset));
             }
         }
+        globalIdxOffset += static_cast<size_t>(drawList->IdxBuffer.Size);
+        globalVtxOffset += drawList->VtxBuffer.Size;
     }
 
     const auto handle = bd->cmdBuffer.EndRecording();
