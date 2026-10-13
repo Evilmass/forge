@@ -57,7 +57,7 @@ CXXFLAGS	:= $(CFLAGS) -std=c++23 -fno-rtti -fomit-frame-pointer -fno-exceptions 
 
 ASFLAGS	:=	-g $(ARCH)
 
-LDFLAGS  =  -specs=$(TOPDIR)/switch32.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--version-script=$(TOPDIR)/exported.txt -Wl,-init=forge_init -Wl,-fini=forge_fini -Wl,--export-dynamic -nodefaultlibs -Wl,-z,notext
+LDFLAGS  =  -specs=$(TOPDIR)/switch32.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--version-script=$(TOPDIR)/exported.txt -Wl,-init=forge_init -Wl,-fini=forge_fini -Wl,--export-dynamic -nodefaultlibs
 
 LIBS	:= -liniparser -lgcc -lstdc++ -u malloc -lnx32_min -lm
 
