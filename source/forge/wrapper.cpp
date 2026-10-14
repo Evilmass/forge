@@ -2,6 +2,8 @@
 
 #include <nn/os.h>
 
+extern "C" void nnosInitializeMutex(nn::os::MutexType* mutex, bool recursive, int lock_level);
+
 namespace nn::os {
 bool TryWaitLightEvent(LightEventType* event) noexcept;
 }
@@ -50,7 +52,7 @@ extern "C" void forge_nnosClearLightEvent(void* event)
 
 extern "C" void forge_nnosInitializeMutex(void* mutex, bool recursive)
 {
-    nn::os::InitializeMutex(static_cast<nn::os::MutexType*>(mutex), recursive, 0);
+    nnosInitializeMutex(static_cast<nn::os::MutexType*>(mutex), recursive, 0);
 }
 
 extern "C" void forge_nnosLockMutex(void* mutex)
