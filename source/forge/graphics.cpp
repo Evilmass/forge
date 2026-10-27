@@ -336,7 +336,9 @@ void Graphics::setupStyle()
 void Graphics::render()
 {
     const auto menuKey = static_cast<ForgeKey>(forge_config_get()->menu_key);
-    if (forge_input_isKeyPressed(menuKey)) {
+    // The toggle key is a letter, so don't steal it while a widget is capturing
+    // text input -- otherwise typing an 'M' into a field would close the menu.
+    if (!ImGui::GetIO().WantTextInput && forge_input_isKeyPressed(menuKey)) {
         m_uiRendered = !m_uiRendered;
     }
 

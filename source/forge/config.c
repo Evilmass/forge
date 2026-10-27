@@ -1,4 +1,5 @@
 #include "forge/config.h"
+#include "forge/input.h"
 #include "forge/log.h"
 
 #include <iniparser.h>
@@ -39,7 +40,7 @@ Config forge_config_createDefault(void)
 {
     Config cfg = {
         .log_level = "info",
-        .menu_key = 66, // ForgeKey_F9
+        .menu_key = ForgeKey_M,
     };
 
     return cfg;
@@ -57,7 +58,7 @@ Result forge_config_load(void)
     dictionary* dict = iniparser_load(FORGE_CONFIG_PATH);
 
     s_config.log_level = strdup(iniparser_getstring(dict, "log:level", "info"));
-    s_config.menu_key = iniparser_getint(dict, "menu:key", 66);
+    s_config.menu_key = iniparser_getint(dict, "menu:key", ForgeKey_M);
     s_config.menu_font_size = (float)iniparser_getdouble(dict, "menu:font_size", 12.0);
 
     iniparser_freedict(dict);

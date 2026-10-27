@@ -17,6 +17,10 @@ An environment for linking, runtime hooking and code patching in Monster Hunter 
 
 To make keyboard input work, you need to enable "Direct Keyboard Access" in the Ryujinx Input Settings.
 
+Press `M` to toggle the Forge menu. The key is configurable via `menu:key` in
+`romfs/nativeNX/forge/config.ini` (a USB HID usage ID, matching the `ForgeKey`
+enum in `include/forge/input.h`).
+
 ## Building
 
 Be sure to check out submodules first:
