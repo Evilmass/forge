@@ -21,6 +21,11 @@ Press `M` to toggle the Forge menu. The key is configurable via `menu:key` in
 `romfs/nativeNX/forge/config.ini` (a USB HID usage ID, matching the `ForgeKey`
 enum in `include/forge/input.h`).
 
+The menu window opens centered at 60% x 70% of the screen and can be resized
+afterwards. Its base font size (and with it the whole UI scale) is controlled by
+`menu:font_size` in the same file; it is defined for 720p and is scaled
+automatically when the game runs at a higher resolution.
+
 ## Building
 
 Be sure to check out submodules first:

@@ -343,6 +343,19 @@ void Graphics::render()
     }
 
     if (m_uiRendered) {
+        // A plain Begin() auto-fits the window to its content, which leaves it
+        // tiny (and effectively un-resizable) on 720p displays. Seed a
+        // display-relative size/position instead, so it looks the same at any
+        // resolution and can be resized by the user afterwards.
+        const ImVec2 display_size = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowSize(
+            ImVec2(display_size.x * 0.6f, display_size.y * 0.7f),
+            ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(
+            ImVec2(display_size.x * 0.5f, display_size.y * 0.5f),
+            ImGuiCond_FirstUseEver,
+            ImVec2(0.5f, 0.5f));
+
         if (ImGui::Begin("forge", &m_uiRendered)) {
             if (ImGui::CollapsingHeader("About Forge")) {
                 ImGui::Text("Version: %s", FORGE_VERSION);
